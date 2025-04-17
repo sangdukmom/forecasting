@@ -1,0 +1,156 @@
+import torch
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+from model.net import DLinear_with_emb as Model
+from config import cfg
+
+# -------- 사용자 설정 --------
+trend_model_path = "C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/forecasting_results/best_results/250415_y6/trend_Dlinear_12.pth"
+seasonal_model_path = "C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/forecasting_results/best_results/250415_y6/seasonal_Dlinear_2.pth"
+
+seasonal_x_data_path = "C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/preprocessing_results/granger_components/select_feature_seasonal.csv"
+trend_x_data_path = "C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/preprocessing_results/granger_components/select_feature_trend.csv"
+
+seasonal_x_data = pd.read_csv(seasonal_x_data_path)
+trend_x_data = pd.read_csv(trend_x_data_path)
+
+seasonal_x_data['Date'] = pd.to_datetime(seasonal_x_data['Date'])
+trend_x_data['Date'] = pd.to_datetime(trend_x_data['Date'])
+
+seasonal_x_data.set_index('Date', inplace=True)
+trend_x_data.set_index('Date', inplace=True)
+
+seasonal_x_data = seasonal_x_data.loc[:'2025-12']
+trend_x_data = trend_x_data.loc[:'2025-12']
+
+trend_x_names = list(trend_x_data.columns)     # trend 모델의 X 인자 리스트
+seasonal_x_names = list(seasonal_x_data.columns)  # seasonal 모델의 X 인자 리스트
+
+seasonal_x_names.remove('Unnamed: 0')
+seasonal_x_names.remove('Y6_1_1_2')
+trend_x_names.remove('Unnamed: 0')
+trend_x_names.remove('Y6_2_0_2')
+
+output_dir = "C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/forecasting_results/best_results/250415_y6"
+top_n = 20
+
+def load_fc1_fc2_weights(path, input_size):
+    model_cfg = cfg['model_cfg'].copy()
+    model_cfg['input_size'] = input_size
+    model = Model(**model_cfg)
+    model.load_state_dict(torch.load(path, map_location='cpu'))
+    model.eval()
+    w_fc1 = model.fc1.weight.detach().cpu().numpy().flatten()
+    w_fc2 = model.fc2.weight.detach().cpu().numpy().flatten()
+    return w_fc1 + w_fc2
+
+# 1. 각각의 모델에서 fc1 + fc2 합산 가중치 추출
+w_trend = load_fc1_fc2_weights(trend_model_path, len(trend_x_names))
+w_seasonal = load_fc1_fc2_weights(seasonal_model_path, len(seasonal_x_names))
+
+# 2. 데이터프레임 생성
+df_trend = pd.DataFrame({'X': trend_x_names, 'trend_weight': w_trend})
+df_seasonal = pd.DataFrame({'X': seasonal_x_names, 'seasonal_weight': w_seasonal})
+
+# 3. 통합: 동일 X변수 기준으로 합산
+df_merged = pd.merge(df_trend, df_seasonal, on='X', how='outer').fillna(0)
+df_merged['total_weight'] = df_merged['trend_weight'] + df_merged['seasonal_weight']
+df_merged['abs_total_weight'] = np.abs(df_merged['total_weight'])
+
+# 4. 저장 및 시각화
+df_sorted = df_merged.sort_values(by='abs_total_weight', ascending=False)
+# df_sorted.to_csv(f"{output_dir}/dlinear_total_weight_summary_2.csv", index=False, encoding='cp949')
+
+# 5. Plot top N
+top_df = df_sorted.head(top_n)
+plt.figure(figsize=(10, 6))
+plt.barh(top_df['X'], top_df['total_weight'], color='teal')
+plt.gca().invert_yaxis()
+plt.xlabel("Trend + Seasonal Total Weight")
+plt.title("Top X Variables by Total DLinear Weight")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(f"{output_dir}/dlinear_total_weight_top{top_n}.png", dpi=300)
+plt.show()
+
+print("✅ 두 모델의 fc1 + fc2 합산 분석 완료!")
+
+### 시계열 기여도 분석
+def compute_variable_contributions(X_df, weight_dict):
+    """
+    각 X 변수의 시계열 기여도 계산 : X값 x 가중치
+    """
+
+    contrib_df = pd.DataFrame(index=X_df.index)
+
+    for col in X_df.columns:
+        weight = weight_dict.get(col, 0)
+        contrib_df[col] = X_df[col] * weight
+
+    contrib_df['y_estimated'] = contrib_df.sum(axis=1)
+    return contrib_df
+
+# 1. 가중치 요약 파일 로드
+df_weights = pd.read_csv("C:/Users/SKSiltron/Desktop/project/signpost_project/1_data/forecasting_results/best_results/250415_y6/dlinear_total_weight_summary.csv", encoding='cp949')
+
+# 2. Trend / Seasonal weight_dict 생성
+trend_weight_dict = pd.Series(df_weights['trend_weight'].values, index=df_weights['X']).to_dict()
+seasonal_weight_dict = pd.Series(df_weights['seasonal_weight'].values, index=df_weights['X']).to_dict()
+
+# 기여도 계산
+trend_contrib = compute_variable_contributions(trend_x_data, trend_weight_dict)
+seasonal_contrib = compute_variable_contributions(seasonal_x_data, seasonal_weight_dict)
+
+# 기여도 합산
+combined_contrib = trend_contrib.drop(columns='y_estimated', errors='ignore').add(seasonal_contrib.drop(columns='y_estimated', errors='ignore'), fill_value=0)
+combined_contrib['y_total_estimated'] = combined_contrib.sum(axis=1)
+
+# 기여도 시계열 시각화 (선 그래프 & 서브플롯)
+
+def plot_contributions_lines(contrib_df, top_n=10, title='Variable Contributions (Line)', output_path=None):
+    """
+    상위 N개 변수 기여도를 선 그래프로 시각화
+    """
+
+    # top_vars = contrib_df.drop(columns='y_total_estimated').abs().sum().sort_values(ascending=False).head(top_n).index.tolist()
+    top_vars = contrib_df.drop(columns='y_total_estimated').abs().mean().sort_values(ascending=False).head(top_n).index.tolist()
+    
+    plt.figure(figsize=(14, 6))
+    for var in top_vars:
+        plt.plot(contrib_df.index, contrib_df[var], label=var)
+
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel("Contribution")
+    plt.grid(True)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+    plt.show()
+
+def plot_contributions_subplots(contrib_df, top_n=6):
+    """
+    상위 N개 변수 기여도를 subplots 으로 각각 시각화
+    """
+    # top_vars = contrib_df.drop(columns='y_total_estimated').abs().sum().sort_values(ascending=False).head(top_n).index.tolist()
+    top_vars = contrib_df.drop(columns='y_total_estimated').abs().mean().sort_values(ascending=False).head(top_n).index.tolist()
+    
+    fig, axes = plt.subplots(nrows=top_n, ncols=1, figsize=(12, 2.5 * top_n), sharex=True)
+
+    for i, var in enumerate(top_vars):
+        axes[i].plot(contrib_df.index, contrib_df[var], label=var)
+        axes[i].set_title(f"{var} Contribution")
+        axes[i].grid(True)
+        axes[i].legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.show()
+
+plot_contributions_lines(combined_contrib, top_n=8, title='Top 8 Variables - Line Plot', output_path='top8_line_plot.png')
+
+plot_contributions_subplots(combined_contrib, top_n=6)
